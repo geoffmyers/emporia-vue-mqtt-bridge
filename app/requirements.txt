@@ -1,0 +1,2 @@
+paho-mqtt==2.1.0
+pyemvue==0.18.9
