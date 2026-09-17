@@ -55,7 +55,7 @@ Every push to `main` builds these for `linux/amd64` and `linux/arm64` and
 pushes them to the GitHub Container Registry ([`.github/workflows/images.yml`](.github/workflows/images.yml)),
 tagged `latest` and `sha-<commit>`:
 
-- `ghcr.io/geoffmyers/emporia-vue-mqtt-bridge`: `Dockerfile`, with the application code added
+- [`ghcr.io/geoffmyers/emporia-vue-mqtt-bridge`](https://github.com/geoffmyers/emporia-vue-mqtt-bridge/pkgs/container/emporia-vue-mqtt-bridge): `Dockerfile`, with the application code added
 
 <!-- RELEASES:END -->
 
