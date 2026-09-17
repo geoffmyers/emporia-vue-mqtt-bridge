@@ -22,6 +22,7 @@ for every account). Token re-auth on `NotAuthorized`.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -32,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt  # noqa: F401  (pulled in via ha_mqtt_bridge but explicit for clarity)
+import requests
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
 from ha_mqtt_bridge import (
@@ -41,6 +43,7 @@ from ha_mqtt_bridge import (
     build_discovery_payload,
     configure_logging,
     register_github_error_reporter,
+    watch_ha_birth,
 )
 
 
@@ -58,6 +61,11 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ["MQTT_PASSWORD"]
+# Off by default (current behaviour) — set MQTT_TLS=1 for a broker that
+# requires TLS; MQTT_CA_FILE points at a custom CA bundle (system trust
+# store is used when unset).
+MQTT_TLS = os.environ.get("MQTT_TLS", "0") != "0"
+MQTT_CA_FILE = os.environ.get("MQTT_CA_FILE") or None
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 DISCOVERY_PREFIX = os.environ.get("HA_DISCOVERY_PREFIX", "homeassistant")
@@ -107,6 +115,14 @@ class Channel:
     type: str | None
     watts: float | None = None
     kwh_per_min: float | None = None
+    # Running kWh total, integrated from `watts` over wall-clock time
+    # between polls (a left-Riemann sum of the same power reading the
+    # `_power` sensor already publishes — equivalent to what users were
+    # doing by hand with HA's own Riemann-sum "Integration" helper
+    # against that entity). Seeded from the last retained value on
+    # startup so a bridge restart doesn't reset the Energy dashboard's
+    # history to zero; see `seed_energy_from_retained`.
+    energy_kwh: float = 0.0
 
 
 @dataclass
@@ -126,6 +142,39 @@ def emporia_login() -> PyEmVue:
     vue = PyEmVue()
     vue.login(username=USERNAME, password=PASSWORD)
     return vue
+
+
+def is_auth_error(vue: PyEmVue, exc: BaseException) -> bool:
+    """True if `exc` looks like an expired/invalid Emporia session.
+
+    Prefers pyemvue's own exception types over string-matching:
+
+      - `requests.HTTPError` with a 401 response — pyemvue's internal
+        `Auth.request()` already retries once on 401 with a token
+        refresh; this only fires when that refresh itself didn't fix it
+        (`response.raise_for_status()` in e.g. `get_devices()` raises
+        this for a 401 that persists after the retry).
+      - `NotAuthorizedException` — the boto3-generated exception
+        pycognito raises from `Auth.refresh_tokens()` when the refresh
+        token itself is no longer valid. Generated dynamically per
+        botocore client, so it's read off the live `vue` instance
+        rather than imported.
+
+    Falls back to the original substring check for anything neither
+    type covers (pyemvue doesn't guarantee every auth-shaped failure
+    surfaces as one of the above)."""
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        if resp is not None and resp.status_code == 401:
+            return True
+    try:
+        not_authorized = vue.auth.cognito.client.exceptions.NotAuthorizedException
+    except AttributeError:
+        not_authorized = None
+    if not_authorized is not None and isinstance(exc, not_authorized):
+        return True
+    err_str = str(exc)
+    return "NotAuthorized" in err_str or "Unauthorized" in err_str or "401" in err_str
 
 
 def discover_devices(vue: PyEmVue) -> list[Device]:
@@ -195,6 +244,76 @@ def poll_instant_usage(vue: PyEmVue, devices: list[Device]) -> None:
             ch.watts = float(kwh_per_min) * 60.0 * 1000.0
 
 
+def accumulate_energy(devices: list[Device], elapsed_hours: float) -> None:
+    """Integrate each channel's current `watts` over `elapsed_hours`
+    (the wall-clock time since the previous poll) into `energy_kwh`.
+
+    A left-Riemann sum, same approximation HA's own "Integration -
+    Riemann sum" helper makes against a power sensor — this just bakes
+    that into the bridge so the result is a real `total_increasing`
+    energy entity usable in HA's Energy dashboard without any
+    per-install helper configuration. Downtime is not back-filled: the
+    total simply resumes accumulating from wherever it left off,
+    which is the same limitation any restart-seeded integration has.
+    """
+    if elapsed_hours <= 0:
+        return
+    for d in devices:
+        for ch in d.channels:
+            if ch.watts is None:
+                continue
+            ch.energy_kwh += (ch.watts / 1000.0) * elapsed_hours
+
+
+def energy_state_topic(device_gid: int, slug: str) -> str:
+    return f"{TOPIC_PREFIX}/{device_gid}/{slug}/energy_kwh"
+
+
+def seed_energy_from_retained(
+    pub: ThreadedPublisher,
+    devices: list[Device],
+    log: logging.Logger,
+    wait_s: float = 2.5,
+) -> None:
+    """Read back each channel's last-published `energy_kwh` (published
+    retained) so the running total survives a bridge restart — this
+    stack has no data volume to persist to (see docker-compose.example.yml),
+    so the retained MQTT message IS the persistence layer.
+
+    Subscribes, blocks briefly for the broker to deliver any retained
+    message, then swaps in a no-op handler so a later echo of the
+    bridge's own publish (or a stray duplicate delivery) can't
+    overwrite the now-live running total mid-flight.
+    """
+    by_topic: dict[str, Channel] = {
+        energy_state_topic(d.device_gid, ch.slug): ch
+        for d in devices for ch in d.channels
+    }
+    if not by_topic:
+        return
+
+    def _on_retained(topic: str, payload: bytes) -> None:
+        ch = by_topic.get(topic)
+        if ch is None:
+            return
+        try:
+            ch.energy_kwh = float(payload.decode())
+        except (ValueError, UnicodeDecodeError):
+            log.warning("bad retained energy_kwh payload on %s: %r", topic, payload)
+
+    for topic in by_topic:
+        pub.subscribe(topic, _on_retained)
+    if not pub.wait_until_connected(timeout=10.0):
+        log.warning("MQTT not connected after 10s; energy totals may start from 0")
+    time.sleep(wait_s)
+    noop = lambda _topic, _payload: None  # noqa: E731
+    for topic in by_topic:
+        pub.subscribe(topic, noop)
+    seeded = sum(1 for ch in {id(c): c for c in by_topic.values()}.values() if ch.energy_kwh)
+    log.info("energy totals seeded from retained state: %d/%d channel(s) non-zero",
+              seeded, len(by_topic))
+
+
 # -------------------------------------------------------------- HA Discovery
 
 
@@ -236,6 +355,25 @@ def discovery_specs(devices: list[Device]) -> list[tuple[str, str, dict]]:
                     **avail,
                 ),
             ))
+            # NEW unique_id suffix (`_energy`, distinct from `_power`) so
+            # existing power entities and their HA history are untouched.
+            energy_unique_id = f"{dev_uid}_{slug}_energy"
+            items.append((
+                "sensor",
+                f"{dev_uid}/{slug}_energy",
+                build_discovery_payload(
+                    name=f"{ch.display} Energy",
+                    unique_id=energy_unique_id,
+                    object_id=energy_unique_id,
+                    state_topic=energy_state_topic(d.device_gid, slug),
+                    device=device_block,
+                    device_class="energy",
+                    unit_of_measurement="kWh",
+                    state_class="total_increasing",
+                    icon="mdi:lightning-bolt",
+                    **avail,
+                ),
+            ))
     return items
 
 
@@ -251,9 +389,11 @@ def publish_channels(pub: ThreadedPublisher, devices: list[Device]) -> int:
             if ch.watts is None:
                 continue
             pub.publish_state(f"{base}/{ch.slug}/watts", f"{ch.watts:.1f}")
+            pub.publish_state(energy_state_topic(d.device_gid, ch.slug), f"{ch.energy_kwh:.6f}")
             usage_payload[ch.slug] = {
                 "watts": round(ch.watts, 1),
                 "kwh_per_min": round(ch.kwh_per_min or 0, 6),
+                "energy_kwh": round(ch.energy_kwh, 6),
                 "channel": ch.channel_num,
                 "display": ch.display,
             }
@@ -297,16 +437,25 @@ def main() -> int:
         host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USER, password=MQTT_PASS,
         client_id=f"emporia-vue-mqtt-bridge-{uuid.uuid4().hex[:8]}",
         lwt_topic=BRIDGE_LWT_TOPIC, discovery_prefix=DISCOVERY_PREFIX,
-        health_path="/tmp/healthy",
+        health_path="/tmp/healthy", tls=MQTT_TLS, ca_file=MQTT_CA_FILE,
     )
     pub.start()
 
-    # Publish discovery once on startup
-    discovery_count = 0
-    for component, unique_id, payload in discovery_specs(devices):
-        pub.publish_discovery(component=component, unique_id=unique_id, payload=payload)
-        discovery_count += 1
-    log.info("discovery published: %d entities", discovery_count)
+    def publish_all_discovery() -> None:
+        count = 0
+        for component, unique_id, payload in discovery_specs(devices):
+            pub.publish_discovery(component=component, unique_id=unique_id, payload=payload)
+            count += 1
+        log.info("discovery published: %d entities", count)
+
+    publish_all_discovery()
+
+    # No data volume on this stack (see docker-compose.example.yml) — the
+    # running energy total is persisted as a retained MQTT topic instead;
+    # read it back before the first poll so a restart doesn't zero it.
+    seed_energy_from_retained(pub, devices, log)
+
+    watch_ha_birth(pub, publish_all_discovery, discovery_prefix=DISCOVERY_PREFIX)
 
     stopping = False
 
@@ -318,25 +467,27 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
+    last_poll_monotonic = time.monotonic()
+
     while not stopping:
         try:
             poll_instant_usage(vue, devices)
+            now_mono = time.monotonic()
+            elapsed_hours = max(0.0, (now_mono - last_poll_monotonic) / 3600.0)
+            last_poll_monotonic = now_mono
+            accumulate_energy(devices, elapsed_hours)
             n = publish_channels(pub, devices)
             log.debug("poll ok: %d channel reading(s) published", n)
         except Exception as e:
-            # pyemvue raises NotAuthorizedException via its inner cognito client;
-            # rather than introspect the exception class hierarchy, just blanket
-            # re-auth on any failure that smells like an auth error.
-            err_str = str(e)
-            if "NotAuthorized" in err_str or "Unauthorized" in err_str or "401" in err_str:
-                log.warning("auth expired (%s); re-logging in", err_str)
+            if is_auth_error(vue, e):
+                log.warning("auth expired (%s); re-logging in", e)
                 try:
                     vue = emporia_login()
-                except Exception as e2:
-                    log.error("re-login failed: %s", e2)
+                except Exception:
+                    log.exception("re-login failed")
                     time.sleep(30)
             else:
-                log.error("poll failed: %s", err_str)
+                log.exception("poll failed")
 
         for _ in range(POLL_INTERVAL):
             if stopping:

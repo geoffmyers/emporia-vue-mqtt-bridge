@@ -43,6 +43,12 @@ with no entity collision.
 
 - Polls Emporia's cloud API for every device and circuit on your account and
   publishes instantaneous power (in watts) per circuit.
+- Publishes a running per-circuit energy total (`device_class: energy`,
+  `state_class: total_increasing`, kWh) alongside the power reading, so
+  every circuit can be added to Home Assistant's Energy dashboard without
+  a separate Riemann-sum helper. Integrated from the same watts reading
+  the power sensor publishes, and persisted across a bridge restart (see
+  [Usage](#usage)).
 - Publishes Home Assistant MQTT Discovery configs automatically — no manual
   YAML.
 - Runs alongside the official `emporia_vue` integration without entity-id
@@ -102,18 +108,35 @@ polling every `POLL_INTERVAL` seconds (60 by default).
 Each Emporia device (a Vue 2 controller, or an expander panel) becomes its
 own Home Assistant device named `Emporia Bridge: <device name>`, with one
 `sensor.<channel>_power` entity per circuit (`device_class: power`,
-`unit_of_measurement: W`). The whole-house aggregate channel Emporia calls
-`Mains` becomes the `main` slug, and its unmonitored-remainder channel
-becomes `balance`.
+`unit_of_measurement: W`) and one `sensor.<channel>_energy` entity
+(`device_class: energy`, `state_class: total_increasing`, kWh) — add the
+latter to HA's Energy dashboard per-circuit. The energy total is
+integrated in the bridge itself (a left-Riemann sum against the watts
+reading, the same approximation HA's own "Riemann sum integral" helper
+makes) and is seeded from the last retained MQTT value on startup, so a
+bridge restart resumes the running total instead of resetting it to zero
+— a genuine outage (bridge or broker down) is *not* back-filled, the
+total just resumes from wherever it left off. The whole-house aggregate
+channel Emporia calls `Mains` becomes the `main` slug, and its
+unmonitored-remainder channel becomes `balance`.
 
 A device also gets a `usage` topic (`emporia/<device_gid>/usage`) carrying a
-single JSON payload per poll with every channel's current watts and
-kWh-per-minute — useful if you want one MQTT subscription for a whole
-device instead of one topic per circuit.
+single JSON payload per poll with every channel's current watts,
+kWh-per-minute and running energy total — useful if you want one MQTT
+subscription for a whole device instead of one topic per circuit.
 
-Renaming a circuit in the Emporia app changes its slug (and therefore its
-Home Assistant entity ID) on the next bridge restart, since the slug is
-derived from the circuit name.
+> [!WARNING]
+> **Renaming a circuit in the Emporia app orphans its Home Assistant
+> entity and history.** Both the `_power` and `_energy` unique IDs are
+> derived from the circuit name's slug (e.g. `"7/9 - Dryer"` → `dryer`),
+> not from a stable Emporia channel identifier — this bridge deliberately
+> does not change that scheme, because doing so would itself orphan every
+> *existing* installation's entities. A rename is picked up on the next
+> bridge restart as a brand-new entity with a fresh (zeroed) energy
+> total; the old entity and its history stay behind as orphans you'll
+> need to remove from Home Assistant's entity registry by hand. Pick a
+> circuit's Emporia-app name once and avoid renaming it later if you
+> care about that circuit's energy history.
 
 ## Configuration
 
@@ -127,6 +150,8 @@ Environment variables, set in `.env` (`.env.example` lists them all):
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USER` | *(empty)* | MQTT username |
 | `MQTT_PASSWORD` | *(required)* | MQTT password |
+| `MQTT_TLS` | `0` | Set to `1` for a broker that requires TLS |
+| `MQTT_CA_FILE` | *(unset)* | Path to a custom CA bundle; leave unset to use the system trust store (only consulted when `MQTT_TLS=1`) |
 | `POLL_INTERVAL` | `60` | Seconds between polls |
 | `HA_DISCOVERY_PREFIX` | `homeassistant` | Home Assistant MQTT Discovery topic prefix |
 | `MQTT_TOPIC_PREFIX` | `emporia` | Prefix for this bridge's own MQTT topics |
